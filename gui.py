@@ -2,7 +2,8 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, List
+
 
 from PySide6.QtCore import Qt, QMimeData, QThread, Signal, QSize
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QAction
@@ -61,8 +62,9 @@ def chamar_agente_ia_pdf(caminho_pdf: Path) -> str:
 # ==========================
 @dataclass
 class JobParams:
-    arquivo: Path
+    arquivos: List[Path]
     func: Callable[[Path], str]
+
 
 
 class IAWorker(QThread):
@@ -80,6 +82,7 @@ class IAWorker(QThread):
 
     def run(self) -> None:
         try:
+            # Fase inicial de "loading"
             for i in range(0, 40):
                 if self._cancel:
                     self.failed.emit("Execução cancelada.")
@@ -91,8 +94,16 @@ class IAWorker(QThread):
                 self.failed.emit("Execução cancelada.")
                 return
 
-            resp = self.params.func(self.params.arquivo)
+            # Processa TODOS os PDFs
+            textos = []
+            for pdf_path in self.params.arquivos:
+                if self._cancel:
+                    self.failed.emit("Execução cancelada.")
+                    return
+                resp = self.params.func(pdf_path)
+                textos.append(f"=== {pdf_path.name} ===\n{resp}")
 
+            # Fase final de "loading"
             for i in range(40, 100):
                 if self._cancel:
                     self.failed.emit("Execução cancelada.")
@@ -100,7 +111,10 @@ class IAWorker(QThread):
                 self.progressed.emit(i + 1)
                 time.sleep(0.006)
 
-            self.finished_ok.emit(resp)
+            # Junta tudo em um único texto
+            resultado_final = "\n\n\n".join(textos)
+            self.finished_ok.emit(resultado_final)
+
         except Exception as exc:
             self.failed.emit(f"Erro ao consultar a IA: {exc!s}")
 
@@ -163,7 +177,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 580)
         self.setWindowIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
 
-        self._arquivo: Optional[Path] = None
+        self._arquivos: List[Path] = []
+
         self._worker: Optional[IAWorker] = None
 
         self._build_ui()
@@ -327,20 +342,39 @@ class MainWindow(QMainWindow):
 
     # ---------- Lógica ----------
     def on_select_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Selecione um PDF", filter="PDF (*.pdf)")
-        if path:
-            p = Path(path)
-            if p.suffix.lower() != ".pdf":
-                QMessageBox.warning(self, "Arquivo inválido", "Selecione um arquivo PDF.")
-                return
-            self.set_file(p)
+        paths, _ = QFileDialog.getOpenFileNames(
+        self,
+        "Selecione um ou mais PDFs",
+        filter="PDF (*.pdf)"
+    )
+        
+        if paths:
+            arquivos = [Path(p) for p in paths]
+            self.set_files(arquivos)
+
+
+    def set_files(self, arquivos: List[Path]) -> None:
+        # Garante que todos são PDFs
+        validos = [p for p in arquivos if p.suffix.lower() == ".pdf"]
+        if not validos:
+            QMessageBox.warning(self, "Arquivo inválido", "Envie apenas arquivos PDF.")
+            return
+
+        self._arquivos = validos
+
+        if len(validos) == 1:
+            self.lbl_arquivo.setText(str(validos[0]))
+        else:
+            nomes = ", ".join(p.name for p in validos)
+            self.lbl_arquivo.setText(f"{len(validos)} PDFs selecionados: {nomes}")
 
     def set_file(self, p: Path) -> None:
+        # Mantém compatibilidade com o DropZone (um arquivo só)
         if p.suffix.lower() != ".pdf":
             QMessageBox.warning(self, "Arquivo inválido", "Envie apenas arquivos PDF.")
             return
-        self._arquivo = p
-        self.lbl_arquivo.setText(str(p))
+        self.set_files([p])
+
 
     def on_toggle_theme(self) -> None:
         dark = self.btn_theme.isChecked()
@@ -350,10 +384,15 @@ class MainWindow(QMainWindow):
     def on_run(self) -> None:
         if self._worker and self._worker.isRunning():
             return
-        if not self._arquivo:
-            QMessageBox.warning(self, "PDF obrigatório", "Selecione ou arraste um arquivo PDF antes de executar.")
+        if not self._arquivos:
+            QMessageBox.warning(
+                self,
+                "PDF obrigatório",
+                "Selecione ou arraste pelo menos um arquivo PDF antes de executar.",
+            )
             return
-        params = JobParams(arquivo=self._arquivo, func=chamar_agente_ia_pdf)
+
+        params = JobParams(arquivos=self._arquivos, func=chamar_agente_ia_pdf)
         self._worker = IAWorker(params)
         self._worker.progressed.connect(self.progress.setValue)
         self._worker.finished_ok.connect(self._on_finished_ok)
@@ -364,6 +403,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.out.clear()
         self._worker.start()
+
 
     def on_cancel(self) -> None:
         if self._worker and self._worker.isRunning():
