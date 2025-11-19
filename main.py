@@ -24,7 +24,7 @@ _client: OpenAI | None = None
 def _get_client() -> OpenAI:
     global _client
     if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = "OPENAI-KEY"
         if not api_key:
             raise RuntimeError(
                 "OPENAI_API_KEY não encontrada.\n"
@@ -87,9 +87,14 @@ def preencher_modelo_word(
     
     # REGRA ESPECIAL: VINCULO_COM_TRABALHO
     # Primeiro verifica se existe esse campo nos dados
+        # REGRA ESPECIAL: VINCULO_COM_TRABALHO
+    # Primeiro verifica se existe esse campo nos dados
     if "VINCULO_COM_TRABALHO" in dados_preparados:
-        vinculo_valor = dados_preparados["VINCULO_COM_TRABALHO"].upper().strip()
-        if vinculo_valor == "SIM":
+        vinculo_valor = str(dados_preparados["VINCULO_COM_TRABALHO"]).upper().strip()
+
+        # Se em QUALQUER lugar da resposta aparecer "SIM"
+        # (ex: "Sim", "Sim, possui vínculo", "sim.")
+        if "SIM" in vinculo_valor:
             dados_preparados["VINCULO_COM_TRABALHO"] = (
                 "C)\tDA JUSTIÇA GRATUITA\n\n"
                 "Primeiramente, o art. 129, par. único da Lei 8.213/91  garante a isenção quanto a "
@@ -104,10 +109,9 @@ def preencher_modelo_word(
                 "e provas a ela anexadas."
             )
         else:
-            # Se não for "SIM", remove completamente do dicionário
-            # Isso faz com que o placeholder {VINCULO_COM_TRABALHO} seja mantido no texto
-            # e depois substituído por string vazia no processamento
+            # Se não tiver "SIM" na resposta, não coloca nada no texto final
             dados_preparados["VINCULO_COM_TRABALHO"] = ""
+
 
     # ---------- FUNÇÃO PARA PROCESSAR PARÁGRAFOS ----------
     def processar_paragrafo(p):

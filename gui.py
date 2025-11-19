@@ -1,9 +1,10 @@
 import sys
 import time
+import shutil
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable, List
-
 
 from PySide6.QtCore import Qt, QMimeData, QThread, Signal, QSize
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QAction
@@ -25,11 +26,9 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
-from docx import Document  # python-docx
-
 
 # ==========================
-# Caminho do modelo Word padrão
+# Caminho do modelo Word padrão (ainda pode ser útil no futuro)
 # ==========================
 def _app_base() -> Path:
     """
@@ -48,13 +47,14 @@ TEMPLATE_DOCX = _app_base() / "Pet Inicial modelo para IA.docx"
 # ==========================
 # “Agente de IA” (implementação real)
 # ==========================
-def chamar_agente_ia_pdf(caminho_pdf: Path) -> str:
+def chamar_agente_ia_pdf(caminhos_pdfs: list[Path]) -> str:
     """
     Encaminha para a função real do seu agente em main.py.
-    Mantém a mesma assinatura esperada pelo IAWorker.
+    Agora usando analisar_pdfs (vários PDFs).
     """
-    from main import analisar_pdf
-    return analisar_pdf(caminho_pdf)
+    from main import analisar_pdfs
+    # Aqui NÃO vamos gerar Word direto, só o texto
+    return analisar_pdfs(caminhos_pdfs, gerar_word=False)
 
 
 # ==========================
@@ -62,9 +62,8 @@ def chamar_agente_ia_pdf(caminho_pdf: Path) -> str:
 # ==========================
 @dataclass
 class JobParams:
-    arquivos: List[Path]
-    func: Callable[[Path], str]
-
+    arquivos: list[Path]
+    func: Callable[[list[Path]], str]
 
 
 class IAWorker(QThread):
@@ -82,41 +81,38 @@ class IAWorker(QThread):
 
     def run(self) -> None:
         try:
-            # Fase inicial de "loading"
-            for i in range(0, 40):
+            # Fase inicial (0% → 40%), subindo de 5 em 5
+            for p in range(0, 15, 5):  # 0, 5, 10, ..., 40
                 if self._cancel:
                     self.failed.emit("Execução cancelada.")
                     return
-                self.progressed.emit(i + 1)
-                time.sleep(0.015)
+                self.progressed.emit(p)
+                time.sleep(0.05)
 
             if self._cancel:
                 self.failed.emit("Execução cancelada.")
                 return
 
-            # Processa TODOS os PDFs
-            textos = []
-            for pdf_path in self.params.arquivos:
+            # Chama a IA UMA vez com todos os PDFs
+            resp = self.params.func(self.params.arquivos)
+
+            if self._cancel:
+                self.failed.emit("Execução cancelada.")
+                return
+
+            # Fase final (40% → 100%), subindo de 5 em 5
+            for p in range(45, 105, 5):  # 45, 50, ..., 100
                 if self._cancel:
                     self.failed.emit("Execução cancelada.")
                     return
-                resp = self.params.func(pdf_path)
-                textos.append(f"=== {pdf_path.name} ===\n{resp}")
+                self.progressed.emit(min(p, 100))
+                time.sleep(0.05)
 
-            # Fase final de "loading"
-            for i in range(40, 100):
-                if self._cancel:
-                    self.failed.emit("Execução cancelada.")
-                    return
-                self.progressed.emit(i + 1)
-                time.sleep(0.006)
-
-            # Junta tudo em um único texto
-            resultado_final = "\n\n\n".join(textos)
-            self.finished_ok.emit(resultado_final)
+            self.finished_ok.emit(resp)
 
         except Exception as exc:
             self.failed.emit(f"Erro ao consultar a IA: {exc!s}")
+
 
 
 # ==========================
@@ -178,7 +174,6 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
 
         self._arquivos: List[Path] = []
-
         self._worker: Optional[IAWorker] = None
 
         self._build_ui()
@@ -246,10 +241,8 @@ class MainWindow(QMainWindow):
         root.addWidget(out_lbl)
         root.addWidget(self.out, 1)
 
-        # Rodapé: copiar / limpar / gerar Word
+        # Rodapé: limpar / gerar Word (sem botão de copiar)
         footer = QHBoxLayout()
-        self.btn_copy = QPushButton("Copiar resposta")
-        self.btn_copy.clicked.connect(self.on_copy)
 
         self.btn_clear = QPushButton("Limpar")
         self.btn_clear.clicked.connect(self.on_clear)
@@ -257,7 +250,6 @@ class MainWindow(QMainWindow):
         self.btn_word = QPushButton("Gerar Word")
         self.btn_word.clicked.connect(self.on_generate_word)
 
-        footer.addWidget(self.btn_copy)
         footer.addWidget(self.btn_clear)
         footer.addWidget(self.btn_word)
         footer.addItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
@@ -266,10 +258,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # Menu “Sobre”
-        about_act = QAction("Sobre", self)
-        about_act.triggered.connect(self.on_about)
-        self.menuBar().addMenu("Ajuda").addAction(about_act)
+    
 
     # ---------- Estilo ----------
     def _apply_style(self, *, dark: bool) -> None:
@@ -343,18 +332,17 @@ class MainWindow(QMainWindow):
     # ---------- Lógica ----------
     def on_select_file(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
-        self,
-        "Selecione um ou mais PDFs",
-        filter="PDF (*.pdf)"
-    )
-        
-        if paths:
-            arquivos = [Path(p) for p in paths]
-            self.set_files(arquivos)
+            self,
+            "Selecione um ou mais PDFs",
+            filter="PDF (*.pdf)",
+        )
+        if not paths:
+            return
 
+        arquivos = [Path(p) for p in paths]
+        self.set_files(arquivos)
 
-    def set_files(self, arquivos: List[Path]) -> None:
-        # Garante que todos são PDFs
+    def set_files(self, arquivos: list[Path]) -> None:
         validos = [p for p in arquivos if p.suffix.lower() == ".pdf"]
         if not validos:
             QMessageBox.warning(self, "Arquivo inválido", "Envie apenas arquivos PDF.")
@@ -369,12 +357,11 @@ class MainWindow(QMainWindow):
             self.lbl_arquivo.setText(f"{len(validos)} PDFs selecionados: {nomes}")
 
     def set_file(self, p: Path) -> None:
-        # Mantém compatibilidade com o DropZone (um arquivo só)
+        # usado pelo DropZone (arrastar/soltar 1 arquivo)
         if p.suffix.lower() != ".pdf":
             QMessageBox.warning(self, "Arquivo inválido", "Envie apenas arquivos PDF.")
             return
         self.set_files([p])
-
 
     def on_toggle_theme(self) -> None:
         dark = self.btn_theme.isChecked()
@@ -404,7 +391,6 @@ class MainWindow(QMainWindow):
         self.out.clear()
         self._worker.start()
 
-
     def on_cancel(self) -> None:
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
@@ -421,88 +407,137 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         QMessageBox.critical(self, "Erro", msg)
 
-    def on_copy(self) -> None:
-        txt = self.out.toPlainText().strip()
-        if not txt:
-            QMessageBox.information(self, "Copiar", "Não há conteúdo para copiar.")
-            return
-        QApplication.clipboard().setText(txt)
-        QMessageBox.information(self, "Copiar", "Resposta copiada!")
-
     def on_clear(self) -> None:
+        """Limpa a saída da IA, desmarca PDFs e reseta a interface."""
+        
+        # 1. Limpa o texto da resposta
         self.out.clear()
+
+        # 2. Limpa arquivos selecionados
+        self._arquivos = []
+
+        # 3. Atualiza o label de arquivos
+        self.lbl_arquivo.setText("Nenhum PDF selecionado")
+
+        # 4. Reseta barra de progresso
+        self.progress.setValue(0)
+
+        # 5. Garante que botões estão no estado correto
+        self.btn_run.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+
+        # 6. (opcional) limpar DropZone visualmente — só texto interno
+        self.drop.title.setText("Arraste um PDF aqui")
+        self.drop.subtitle.setText('ou clique em "Selecionar PDF"')
+
 
     def on_generate_word(self) -> None:
         """
-        Gera um Word com base em um modelo padrão (TEMPLATE_DOCX, se existir)
-        contendo:
-        - Arquivo PDF analisado
-        - Resposta da IA
+        Gera o Word usando a RESPOSTA JÁ EXIBIDA da IA.
+        - Não chama o agente novamente.
+        - Usa o mesmo fluxo do main.py: _extrair_json_puro + preencher_modelo_word.
+        - Depois pergunta onde salvar o arquivo .docx.
         """
-        if not self._arquivo:
+        if not self._arquivos:
             QMessageBox.warning(
                 self,
                 "PDF obrigatório",
-                "Selecione ou arraste um arquivo PDF antes de gerar o Word.",
+                "Selecione ou arraste pelo menos um arquivo PDF antes de gerar o Word.",
             )
             return
 
-        # Caminho para salvar o Word
+        # Pega o texto que já está na saída da IA
+        texto = self.out.toPlainText().strip()
+        if not texto:
+            QMessageBox.warning(
+                self,
+                "Sem resposta",
+                "Ainda não há resposta da IA.\n"
+                "Clique primeiro em 'Perguntar à IA' e aguarde a análise.",
+            )
+            return
+
+        try:
+            # Reaproveita as mesmas funções do main.py
+            from main import _extrair_json_puro, preencher_modelo_word
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Erro",
+                f"Não foi possível importar as funções do main.py:\n{e}",
+            )
+            return
+
+        try:
+            # Limpa ```json ... ``` se o modelo devolveu em bloco de código
+            json_puro = _extrair_json_puro(texto)
+
+            # Converte para dicionário (deve bater com as chaves do modelo Word)
+            dados = json.loads(json_puro)
+            if not isinstance(dados, dict):
+                raise ValueError("JSON retornado não é um objeto/dicionário.")
+
+            # Gera o .docx usando o modelo e as chaves (na pasta padrão do main)
+            caminho_docx = preencher_modelo_word(dados)
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Erro ao gerar Word",
+                "Não foi possível gerar o Word a partir da resposta da IA.\n\n"
+                f"Detalhes: {e}",
+            )
+            return
+
+        # Agora pergunta ONDE salvar o arquivo
+        sugestao_nome = Path(caminho_docx).name
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Salvar Word",
-            "Pet Inicial IA.docx",
+            str(Path.home() / sugestao_nome),
             "Documentos Word (*.docx)",
         )
+
         if not save_path:
+            # Usuário cancelou o diálogo – mas o arquivo já foi criado no caminho original
+            QMessageBox.information(
+                self,
+                "Word gerado",
+                f"Petição gerada automaticamente em:\n{caminho_docx}\n\n"
+                "Você cancelou a escolha de outro local para salvar.",
+            )
             return
 
-        resposta = self.out.toPlainText().strip()
-        if not resposta:
-            resposta = "Nenhuma resposta da IA foi gerada ainda."
-
-        # Abre o modelo, se existir; senão cria um documento novo
-        if TEMPLATE_DOCX.exists():
-            doc = Document(TEMPLATE_DOCX)
-        else:
-            doc = Document()
-            doc.add_heading("Petição Inicial - IA", level=1)
-
-        # Adiciona informações do PDF
-        doc.add_paragraph()
-        doc.add_heading("Arquivo analisado", level=2)
-        doc.add_paragraph(str(self._arquivo))
-
-        # Adiciona a resposta da IA
-        doc.add_paragraph()
-        doc.add_heading("Resposta da IA", level=2)
-        for linha in resposta.splitlines():
-            if linha.strip():
-                doc.add_paragraph(linha)
-
+        # Copia o arquivo gerado para o caminho escolhido
         try:
-            doc.save(save_path)
+            shutil.copy2(str(caminho_docx), str(save_path))
         except Exception as e:
             QMessageBox.critical(
                 self,
                 "Erro ao salvar",
-                f"Não foi possível salvar o arquivo Word:\n{e}",
+                "O Word foi gerado, mas não foi possível copiar para o local escolhido.\n\n"
+                f"Arquivo original em:\n{caminho_docx}\n\n"
+                f"Detalhes: {e}",
             )
             return
 
         QMessageBox.information(
             self,
             "Word gerado",
-            "Documento Word gerado com sucesso!",
+            f"Petição Word gerada com sucesso!\n\n"
+            f"Arquivo salvo em:\n{save_path}",
         )
+
 
     def on_about(self) -> None:
         QMessageBox.information(
             self,
             "Sobre",
             "Assistente IA — PDF\n"
-            "Envie um PDF, obtenha a resposta do agente de IA e gere um Word padrão.",
+            "Envie um ou mais PDFs, obtenha a resposta da IA e gere a petição em Word.",
         )
+
+
 
 
 if __name__ == "__main__":
